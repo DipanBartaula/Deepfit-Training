@@ -81,8 +81,9 @@ def modify_transformer_channels(transformer: SD3Transformer2DModel, new_in_chann
         if size is None:
             raise ValueError("Cannot infer PatchEmbed image size; set patch_embed_size or config['image_size']")
         height = width = size
-    patch_size = orig_patch_embed.patch_size if hasattr(orig_patch_embed, "patch_size") else transformer.config.get("patch_size", 2)
-    pos_embed_max_size = getattr(orig_patch_embed, "pos_embed_max_size", None)
+    patch_size = orig_patch_embed.patch_size if hasattr(orig_patch_embed, "patch_size") else 2
+    # pos_embed_max_size = getattr(orig_patch_embed, "pos_embed_max_size", None)
+    pos_embed_max_size = 96
 
     new_patch_embed = PatchEmbed(
         height=height,
@@ -151,12 +152,13 @@ def modify_controlnet_channels(controlnet: SD3ControlNetModel,
     if hasattr(orig_pos, "patch_embed_size"):
         height, width = orig_pos.patch_embed_size
     else:
-        size = controlnet.config.get("image_size", None)
+        size = 2
         if size is None:
             raise ValueError("Cannot infer ControlNet pos_embed image size; set patch_embed_size or config['image_size']")
         height = width = size
-    patch_size = orig_pos.patch_size if hasattr(orig_pos, "patch_size") else controlnet.config.get("patch_size", 2)
-    pos_embed_max_size = getattr(orig_pos, "pos_embed_max_size", None)
+    patch_size = orig_pos.patch_size if hasattr(orig_pos, "patch_size") else 2
+    # pos_embed_max_size = getattr(orig_pos, "pos_embed_max_size", None)
+    pos_embed_max_size=96
 
     new_pos_embed = PatchEmbed(
         height=height,
