@@ -22,35 +22,62 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+
 class JointVirtualTryOnDataset(Dataset):
     """
-    Skeleton for JointVirtualTryOnDataset. You must implement according to your data layout.
-    __getitem__ should return a dict with keys:
-      "person_image": Tensor[C,H,W], 
+    A dummy dataset that returns random tensors for testing. Shapes match:
+      "person_image": Tensor[3,H,W], 
       "mask": Tensor[1,H,W],
-      "clothing_image": Tensor[C,H,W],
-      "tryon_gt": Tensor[C,H,W],
+      "clothing_image": Tensor[3,H,W],
+      "tryon_gt": Tensor[3,H,W],
       "depth_gt": Tensor[1,H,W],
       "normal_gt": Tensor[3,H,W],
       "prompt": str
-    Example implementation is left to you.
+
+    To simulate numerical instability, each tensor is scaled by a random factor
+    drawn log-uniformly between 1e-3 and 1e+3.
     """
-    def __init__(self, data_root: str, transform=None):
+    def __init__(self, data_root: str = None, transform=None, num_samples: int = 1000,
+                 image_size: tuple = (1024, 1024)):
         super().__init__()
-        self.data_root = data_root
         self.transform = transform
-        # TODO: load your sample list, e.g.:
-        # self.samples = ...
-        raise NotImplementedError("Implement JointVirtualTryOnDataset.__init__ according to your data layout")
+        self.num_samples = num_samples
+        self.C, self.H, self.W = 3, *image_size
 
     def __len__(self):
-        return len(self.samples)
+        return self.num_samples
 
     def __getitem__(self, idx):
-        # TODO: load and preprocess:
-        # person image, mask, clothing image, tryon_gt, depth_gt, normal_gt, prompt
-        # Convert to torch.Tensor, dtype=torch.float32 or float16 as needed.
-        raise NotImplementedError("Implement JointVirtualTryOnDataset.__getitem__ according to your data layout")
+        # random log-uniform scale between 1e-3 and 1e3
+        scale = 10 ** torch.empty(1).uniform_(-3, 3)
+
+        # Base random Gaussian tensors
+        person_image    = torch.randn(self.C, self.H, self.W) * scale
+        mask            = torch.rand(1, self.H, self.W)           * scale
+        clothing_image  = torch.randn(self.C, self.H, self.W) * scale
+        tryon_gt        = torch.randn(self.C, self.H, self.W) * scale
+        depth_gt        = torch.randn(1, self.H, self.W)   * scale
+        normal_gt       = torch.randn(3, self.H, self.W)   * scale
+
+        # Simple placeholder prompt
+        prompt = f"sample prompt #{idx}"
+
+        sample = {
+            "person_image": person_image,
+            "mask":         mask,
+            "clothing_image": clothing_image,
+            "tryon_gt":     tryon_gt,
+            "depth_gt":     depth_gt,
+            "normal_gt":    normal_gt,
+            "prompt":       prompt
+        }
+
+        # Apply any user-provided transform (e.g. normalization) to image tensors
+        if self.transform is not None:
+            # expects transform to take and return the full sample dict
+            sample = self.transform(sample)
+
+        return sample
 
 
 def modify_transformer_channels(transformer: SD3Transformer2DModel, new_in_channels: int, new_out_channels: int, device: str):
@@ -80,8 +107,8 @@ def modify_transformer_channels(transformer: SD3Transformer2DModel, new_in_chann
         size = transformer.config.get("image_size", None)
         if size is None:
             raise ValueError("Cannot infer PatchEmbed image size; set patch_embed_size or config['image_size']")
-        height = width = size
-    patch_size = orig_patch_embed.patch_size if hasattr(orig_patch_embed, "patch_size") else 2
+        height = width = 128
+    patch_size = 2
     # pos_embed_max_size = getattr(orig_patch_embed, "pos_embed_max_size", None)
     pos_embed_max_size = 96
 
@@ -152,11 +179,11 @@ def modify_controlnet_channels(controlnet: SD3ControlNetModel,
     if hasattr(orig_pos, "patch_embed_size"):
         height, width = orig_pos.patch_embed_size
     else:
-        size = 2
+        size = 128
         if size is None:
             raise ValueError("Cannot infer ControlNet pos_embed image size; set patch_embed_size or config['image_size']")
         height = width = size
-    patch_size = orig_pos.patch_size if hasattr(orig_pos, "patch_size") else 2
+    patch_size = 2
     # pos_embed_max_size = getattr(orig_pos, "pos_embed_max_size", None)
     pos_embed_max_size=96
 
@@ -193,8 +220,8 @@ def modify_controlnet_channels(controlnet: SD3ControlNetModel,
         size = controlnet.config.get("image_size", None)
         if size is None:
             raise ValueError("Cannot infer ControlNet pos_embed_input image size; set patch_embed_size or config['image_size']")
-        height_in = width_in = size
-    patch_size_in = orig_pos_in.patch_size if hasattr(orig_pos_in, "patch_size") else controlnet.config.get("patch_size", 2)
+        height_in = width_in = 128
+    patch_size_in = 2
     pos_embed_max_size_in = getattr(orig_pos_in, "pos_embed_max_size", None)
 
     new_pos_embed_in = PatchEmbed(
