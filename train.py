@@ -19,7 +19,8 @@ from utils import (
     add_noise,
     setup_optimizer,
     save_checkpoint,
-    load_checkpoint
+    load_checkpoint,
+    print_trainable_parameters
 )
 
 from virtual_try_on_dataloader import get_train_val_loaders
@@ -107,6 +108,8 @@ def main():
     model = DeepFit(device=device, debug=args.debug).to(device)
     model.train()
     optimizer = setup_optimizer(model, lr=args.lr)
+    trainable=print_trainable_parameters(model)
+    logger.info(f"Trainable parameters: {trainable}")
 
     # Resume?
     start_step = 0

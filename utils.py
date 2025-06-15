@@ -449,3 +449,37 @@ def setup_wandb(wandb_config: Dict[str, Any]):
     else:
         logger.info("[DEBUG] No W&B logging")
         return False
+
+
+
+
+
+
+def print_trainable_parameters(model, logger: logging.Logger = None):
+    """
+    Print (or log) all trainable parameters of the given model.
+
+    Args:
+        model: a torch.nn.Module whose trainable parameters we want to inspect.
+        logger: optional logging.Logger. If provided, uses logger.info to output;
+                otherwise, uses print().
+    Returns:
+        A list of tuples (name, parameter) for trainable parameters.
+    """
+    use_logger = logger is not None
+    def _out(msg):
+        if use_logger:
+            logger.info(msg)
+        else:
+            print(msg)
+
+    trainable = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
+    _out(f"Trainable parameters ({len(trainable)} tensors):")
+    total_params = 0
+    for name, param in trainable:
+        shape = tuple(param.shape)
+        num = param.numel()
+        total_params += num
+        _out(f"  {name}: shape={shape}, params={num}")
+    _out(f"Total trainable parameters: {total_params}")
+    return trainable
