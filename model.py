@@ -5,14 +5,13 @@ import torch.nn as nn
 from diffusers import AutoencoderKL, SD3Transformer2DModel, SD3ControlNetModel, FlowMatchEulerDiscreteScheduler
 from transformers import CLIPTextModelWithProjection, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 
-from utils import modify_transformer_channels, modify_controlnet_channels, freeze_non_trainable_components
-
+from utils import modify_transformer_channels, modify_controlnet_channels  # remove freeze_non_trainable_components
 
 class DeepFit(nn.Module):
     """
     DeepFit model: loads VAE, text encoders, SD3 Transformer & ControlNet.
     Modifies Transformer and ControlNet channels to desired sizes, copies original weights and zero-inits new channels.
-    Freezes VAE and text encoders; Transformer and ControlNet are fully trainable.
+    Freezes most parts; only specific submodules of Transformer and ControlNet remain trainable.
     """
     def __init__(self,
                  device: str = "cuda",
@@ -139,10 +138,76 @@ class DeepFit(nn.Module):
         if debug:
             print("[DEBUG] ControlNet modified.")
 
-        # 7. Freeze non-trainable parts (VAE, text encoders); leave Transformer & ControlNet fully trainable
-        freeze_non_trainable_components(self)
+        # 7. Freeze most parameters, only keep the specified submodules trainable
         if debug:
-            print("[DEBUG] Frozen VAE and text encoders; Transformer & ControlNet trainable.")
+            print("[DEBUG] Freezing parameters except specified submodules...")
+
+        # First, freeze all parameters globally
+        for name, param in self.named_parameters():
+            param.requires_grad = False
+
+        # Helper: enable requires_grad for parameters whose name matches certain patterns.
+        # Transformer:
+        for name, param in self.transformer.named_parameters():
+            # 1) Transformer PatchEmbed layer: pos_embed.proj
+            if "pos_embed.proj" in name:
+                param.requires_grad = True
+                if debug:
+                    print(f"[DEBUG] Unfreeze transformer PatchEmbed param: {name}")
+                continue
+
+            # 2) Attention weights in transformer blocks
+            if ".transformer_blocks." in name and ".attn." in name:
+                param.requires_grad = True
+                if debug:
+                    print(f"[DEBUG] Unfreeze transformer attention param: {name}")
+                continue
+
+            # 3) Adaptive LayerNorm modulation weights in transformer blocks
+            #    norm1.linear and norm1_context.linear
+            if ".transformer_blocks." in name and (".norm1.linear" in name or ".norm1_context.linear" in name):
+                param.requires_grad = True
+                if debug:
+                    print(f"[DEBUG] Unfreeze transformer AdaLayerNorm param: {name}")
+                continue
+
+            # 4) Final adaptive norm in transformer, if present (e.g., norm_out.linear)
+            if "norm_out.linear" in name:
+                param.requires_grad = True
+                if debug:
+                    print(f"[DEBUG] Unfreeze transformer final norm param: {name}")
+                continue
+
+        # ControlNet:
+        for name, param in self.controlnet.named_parameters():
+            # 1) ControlNet PatchEmbed layers: often named pos_embed.proj or pos_embed_input.proj
+            if ("pos_embed.proj" in name) or ("pos_embed_input.proj" in name):
+                param.requires_grad = True
+                if debug:
+                    print(f"[DEBUG] Unfreeze controlnet PatchEmbed param: {name}")
+                continue
+
+            # 2) Attention weights in controlnet transformer blocks
+            if ".transformer_blocks." in name and ".attn." in name:
+                param.requires_grad = True
+                if debug:
+                    print(f"[DEBUG] Unfreeze controlnet attention param: {name}")
+                continue
+
+            # If you also want adaptive LayerNorm weights in ControlNet trainable,
+            # you could uncomment the following:
+            # if ".transformer_blocks." in name and (".norm1.linear" in name or ".norm1_context.linear" in name):
+            #     param.requires_grad = True
+            #     if debug:
+            #         print(f"[DEBUG] Unfreeze controlnet AdaLayerNorm param: {name}")
+            #     continue
+
+        if debug:
+            # Report total trainable parameters
+            trainable = [(n, p.shape) for n,p in self.named_parameters() if p.requires_grad]
+            print(f"[DEBUG] Total trainable parameters after freezing: {len(trainable)}")
+            for n,sh in trainable:
+                print(f"  {n}: {sh}")
 
         # 8. Scheduler for inference
         if debug:
