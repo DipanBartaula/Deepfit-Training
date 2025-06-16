@@ -1,46 +1,40 @@
-# virtual_try_on_dataloader.py
-
 import os
 import cv2
 import random
 import torch
 import numpy as np
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import torchvision.transforms as transforms
+from torch.multiprocessing import freeze_support
+
 
 # ---------------------- CONFIGURATION ----------------------
 IMAGE_SIZE = (512, 512)
 NORMALIZE_MEAN = (0.5, 0.5, 0.5)
 NORMALIZE_STD = (0.5, 0.5, 0.5)
 
-# Transforms for RGB images
 transform = transforms.Compose([
     transforms.Resize(IMAGE_SIZE),
     transforms.ToTensor(),
     transforms.Normalize(NORMALIZE_MEAN, NORMALIZE_STD)
 ])
 
-# Transforms for grayscale images (depth, mask)
 basic_transform = transforms.Compose([
     transforms.Resize(IMAGE_SIZE),
     transforms.ToTensor()
 ])
 
-
 class VirtualTryOnDataset(Dataset):
     def __init__(self, root_dir):
-        """
-        Args:
-            root_dir (string): Directory with subfolders: image, cloth, normal, depth, mask, caption
-        """
         self.root_dir = root_dir
         self.person_dir = os.path.join(root_dir, "image")
-        self.cloth_dir  = os.path.join(root_dir, "cloth")
+        self.cloth_dir = os.path.join(root_dir, "cloth")
         self.normal_dir = os.path.join(root_dir, "normal")
-        self.depth_dir  = os.path.join(root_dir, "depth")
-        self.mask_dir   = os.path.join(root_dir, "mask")
-        self.caption_dir= os.path.join(root_dir, "caption")
+        self.depth_dir = os.path.join(root_dir, "depth")
+        self.mask_dir = os.path.join(root_dir, "mask")
+        self.caption_dir = os.path.join(root_dir, "caption")
+        self.embed_dir = os.path.join(root_dir, "caption_embeds")
 
         self.image_files = [
             f for f in os.listdir(self.person_dir)
@@ -55,35 +49,39 @@ class VirtualTryOnDataset(Dataset):
         base_name, _ = os.path.splitext(img_file)
 
         # File paths
-        person_path  = os.path.join(self.person_dir, img_file)
-        cloth_path   = os.path.join(self.cloth_dir, img_file)
-        normal_path  = os.path.join(self.normal_dir, f"{base_name}.jpg")
-        depth_path   = os.path.join(self.depth_dir, f"{base_name}.jpg")
-        mask_path    = os.path.join(self.mask_dir, f"{base_name}.png")
+        person_path = os.path.join(self.person_dir, img_file)
+        cloth_base = base_name.replace("_0", "_1")
+        cloth_filename = cloth_base + ".jpg"
+        cloth_path = os.path.join(self.cloth_dir, cloth_filename)
+        # cloth_path = os.path.join(self.cloth_dir, img_file)
+        normal_path = os.path.join(self.normal_dir, f"{base_name}.jpg")
+        depth_path = os.path.join(self.depth_dir, f"{base_name}.jpg")
+        mask_path = os.path.join(self.mask_dir, f"{base_name}.png")
         caption_path = os.path.join(self.caption_dir, f"{base_name}.txt")
+        embed_path = os.path.join(self.embed_dir, f"{base_name}.npz")
 
         # Load images
-        person_pil = Image.open(person_path).convert("RGB")
-        cloth_pil  = Image.open(cloth_path).convert("RGB")
-        normal_pil = Image.open(normal_path).convert("RGB")
-        depth_pil  = Image.open(depth_path).convert("L")
-        mask_pil   = Image.open(mask_path).convert("L")
+        person_image_pil = Image.open(person_path).convert("RGB")
+        cloth_image = Image.open(cloth_path).convert("RGB")
+        normal_map = Image.open(normal_path).convert("RGB")
+        depth_map = Image.open(depth_path).convert("L")
+        mask_pil = Image.open(mask_path).convert("L")
 
-        # Create overlay
-        person_np = np.array(person_pil)
-        mask_np   = np.array(mask_pil)
-        blurred   = cv2.GaussianBlur(mask_np, (21,21), sigmaX=10)
-        alpha     = (blurred.astype(np.float32)/255.0)[...,None]
-        grey      = np.full_like(person_np, 128, dtype=np.uint8)
-        overlay_np= (person_np*(1-alpha) + grey*alpha).astype(np.uint8)
+        # Overlay image
+        person_np = np.array(person_image_pil)
+        mask_np = np.array(mask_pil)
+        blurred_mask = cv2.GaussianBlur(mask_np, (21, 21), sigmaX=10)
+        alpha_mask = np.expand_dims(blurred_mask.astype(np.float32) / 255.0, axis=2)
+        grey_overlay = np.full_like(person_np, 128, dtype=np.uint8)
+        overlay_np = (person_np * (1 - alpha_mask) + grey_overlay * alpha_mask).astype(np.uint8)
         overlay_pil = Image.fromarray(overlay_np)
 
-        # Apply transforms
-        person_image  = transform(person_pil)
-        cloth_image   = transform(cloth_pil)
-        normal_map    = transform(normal_pil)
-        depth_map     = basic_transform(depth_pil)
-        mask_tensor   = basic_transform(mask_pil).squeeze(0)
+        # Transform everything
+        person_image = transform(person_image_pil)
+        cloth_image = transform(cloth_image)
+        normal_map = transform(normal_map)
+        depth_map = basic_transform(depth_map)
+        mask = basic_transform(mask_pil).squeeze(0)
         overlay_image = transform(overlay_pil)
 
         # Load caption
@@ -94,54 +92,79 @@ class VirtualTryOnDataset(Dataset):
         except FileNotFoundError:
             pass
 
+        # Load precomputed embedding
+        try:
+            data = np.load(embed_path)
+            pe = torch.tensor(data['pe']).float()     # [77, D]
+            pp = torch.tensor(data['pp']).float()     # [D]
+        except FileNotFoundError:
+            pe = torch.zeros(77, 1024)
+            pp = torch.zeros(1024)
+
         return {
-            'person_image':  person_image,
-            'cloth_image':   cloth_image,
-            'normal_map':    normal_map,
-            'depth_map':     depth_map,
-            'mask':          mask_tensor,
+            'person_image': person_image,
+            'cloth_image': cloth_image,
+            'normal_map': normal_map,
+            'depth_map': depth_map,
+            'mask': mask,
             'overlay_image': overlay_image,
-            'caption':       caption,
-            'filename':      base_name
+            'caption': caption,
+            'filename': base_name,
+            'prompt_embeds': pe,
+            'pooled_prompt': pp
         }
 
-
-def virtual_try_on_collate_fn(batch):
-    """
-    Collate that blurs masks, optionally includes captions, and stacks all tensors.
-    """
+def custom_collate_fn(batch):
     include_caption = (random.random() < 0.2)
 
-    person_images, cloth_images, normal_maps = [], [], []
-    depth_maps, masks, overlay_images         = [], [], []
-    captions, filenames                       = [], []
-
-    for item in batch:
-        # Blur mask
-        mask_np = item['mask'].cpu().numpy().astype(np.uint8)
-        blurred = cv2.GaussianBlur(mask_np, (39,39), 0).astype(np.float32) / 255.0
-        mask_t  = torch.from_numpy(blurred)
-
-        person_images.append(   item['person_image'])
-        cloth_images.append(    item['cloth_image'])
-        normal_maps.append(     item['normal_map'])
-        depth_maps.append(      item['depth_map'])
-        masks.append(           mask_t)
-        overlay_images.append(  item['overlay_image'])
-        captions.append(        item['caption'] if include_caption else "")
-        filenames.append(       item['filename'])
-
-    return {
-        'person_image':  torch.stack(person_images),
-        'cloth_image':   torch.stack(cloth_images),
-        'normal_map':    torch.stack(normal_maps),
-        'depth_map':     torch.stack(depth_maps),
-        'mask':          torch.stack(masks),
-        'overlay_image': torch.stack(overlay_images),
-        'caption':       captions,
-        'filename':      filenames
+    batch_dict = {
+        'person_image':  torch.stack([b['person_image'] for b in batch]),
+        'cloth_image':   torch.stack([b['cloth_image'] for b in batch]),
+        'normal_map':    torch.stack([b['normal_map'] for b in batch]),
+        'depth_map':     torch.stack([b['depth_map'] for b in batch]),
+        'mask':          torch.stack([
+            torch.from_numpy(cv2.GaussianBlur(b['mask'].cpu().numpy().astype(np.uint8), (39, 39), 0).astype(np.float32) / 255.0)
+            for b in batch
+        ]),
+        'overlay_image': torch.stack([b['overlay_image'] for b in batch]),
+        'caption':       [b['caption'] if include_caption else "" for b in batch],
+        'filename':      [b['filename'] for b in batch],
+        'pe':            torch.stack([b['prompt_embeds'] for b in batch]),  # [B, 77, D]
+        'pp':            torch.stack([b['pooled_prompt'] for b in batch])   # [B, D]
     }
+    return batch_dict
 
+# ----------- Example usage -------------
+
+
+
+    dataset = CustomDataset(root_dir="D:\\Pul - DeepFit\\Test\\dresses")
+    dataloader = DataLoader(
+        dataset,
+        batch_size=8,
+        shuffle=True,
+        collate_fn=custom_collate_fn,
+        num_workers=4,
+        pin_memory=True
+    )
+
+    # One batch test
+    for batch in dataloader:
+        print("Person:",   batch["person_image"].shape)
+        print("Cloth:",    batch["cloth_image"].shape)
+        print("Normal:",   batch["normal_map"].shape)
+        print("Depth:",    batch["depth_map"].shape)
+        print("Mask:",     batch["mask"].shape)
+        print("Overlay:",  batch["overlay_image"].shape)
+        print("PE:",       batch["prompt_embeds"])   # [B, 77, D]
+        print("PP:",       batch["pooled_prompt"])   # [B, D]
+        print("Captions:", batch["caption"])
+        break
+
+
+
+
+ 
 
 def get_train_val_loaders(
     root_dir: str,

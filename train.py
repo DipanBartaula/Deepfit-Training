@@ -1,5 +1,3 @@
-# train.py
-
 import os
 import argparse
 import logging
@@ -13,7 +11,6 @@ from utils import (
     JointVirtualTryOnDataset,
     seed_everything,
     setup_wandb,
-    encode_prompt,
     prepare_control_input,
     prepare_target_latents,
     add_noise,
@@ -108,7 +105,7 @@ def main():
     model = DeepFit(device=device, debug=args.debug).to(device)
     model.train()
     optimizer = setup_optimizer(model, lr=args.lr)
-    trainable=print_trainable_parameters(model)
+    trainable = print_trainable_parameters(model)
     logger.info(f"Trainable parameters: {trainable}")
 
     # Resume?
@@ -134,13 +131,11 @@ def main():
             tryon    = batch["overlay_image"].to(device, dtype=torch.float16)
             depth    = batch["depth_map"].to(device, dtype=torch.float16)
             normal   = batch["normal_map"].to(device, dtype=torch.float16)
-            prompts  = batch["caption"]
+            # Prompt embeddings from DataLoader
+            pe       = batch["prompt_embeds"].to(device, dtype=torch.float16)
+            pp       = batch["pooled_prompt"].to(device, dtype=torch.float16)
 
             # forward
-            pe, pp = encode_prompt(model, model.tokenizer1, model.text_encoder1,
-                                   model.tokenizer2, model.text_encoder2,
-                                   model.tokenizer3, model.text_encoder3,
-                                   prompts, device, args.debug)
             ctrl = prepare_control_input(person, mask, cloth, model.vae, args.debug)
             tgt  = prepare_target_latents(tryon, depth, normal, model.vae, args.debug)
             noised, noise, t = add_noise(tgt, args.debug)
@@ -183,12 +178,9 @@ def main():
                 tryon    = batch["overlay_image"].to(device, dtype=torch.float16)
                 depth    = batch["depth_map"].to(device, dtype=torch.float16)
                 normal   = batch["normal_map"].to(device, dtype=torch.float16)
-                prompts  = batch["caption"]
+                pe       = batch["prompt_embeds"].to(device, dtype=torch.float16)
+                pp       = batch["pooled_prompt"].to(device, dtype=torch.float16)
 
-                pe, pp = encode_prompt(model, model.tokenizer1, model.text_encoder1,
-                                       model.tokenizer2, model.text_encoder2,
-                                       model.tokenizer3, model.text_encoder3,
-                                       prompts, device, False)
                 ctrl = prepare_control_input(person, mask, cloth, model.vae, False)
                 tgt  = prepare_target_latents(tryon, depth, normal, model.vae, False)
                 noised, noise, t = add_noise(tgt, False)

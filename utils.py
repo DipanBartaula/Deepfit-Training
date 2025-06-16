@@ -25,24 +25,50 @@ logging.basicConfig(level=logging.INFO)
 
 class JointVirtualTryOnDataset(Dataset):
     """
-    A dummy dataset that returns random tensors for testing. Shapes match:
-      "person_image": Tensor[3,H,W], 
-      "mask": Tensor[1,H,W],
-      "clothing_image": Tensor[3,H,W],
-      "tryon_gt": Tensor[3,H,W],
-      "depth_gt": Tensor[1,H,W],
-      "normal_gt": Tensor[3,H,W],
-      "prompt": str
+    A dummy dataset that returns random tensors *and* prompt embeddings for testing. 
 
-    To simulate numerical instability, each tensor is scaled by a random factor
-    drawn log-uniformly between 1e-3 and 1e+3.
+    Each sample dict contains:
+      - "person_image":    Tensor[3, H, W]
+      - "mask":            Tensor[1, H, W]
+      - "clothing_image":  Tensor[3, H, W]
+      - "tryon_gt":        Tensor[3, H, W]
+      - "depth_gt":        Tensor[1, H, W]
+      - "normal_gt":       Tensor[3, H, W]
+      - "prompt_embeds":   Tensor[B, seq_len, dim]
+      - "pooled_prompt":   Tensor[B, 2048]
     """
-    def __init__(self, data_root: str = None, transform=None, num_samples: int = 1000,
-                 image_size: tuple = (1024, 1024)):
+    def __init__(
+        self,
+        data_root: Optional[str] = None,
+        transform=None,
+        num_samples: int = 1000,
+        image_size: tuple = (1024, 1024),
+        # new args for encoding
+        tokenizer1: CLIPTokenizer = None,
+        text_encoder1: CLIPTextModelWithProjection = None,
+        tokenizer2: CLIPTokenizer = None,
+        text_encoder2: CLIPTextModelWithProjection = None,
+        tokenizer3: T5TokenizerFast = None,
+        text_encoder3: T5EncoderModel = None,
+        device: str = "cuda",
+        debug: bool = False
+    ):
         super().__init__()
         self.transform = transform
         self.num_samples = num_samples
         self.C, self.H, self.W = 3, *image_size
+
+        # for prompt encoding
+        assert all([tokenizer1, text_encoder1, tokenizer2, text_encoder2, tokenizer3, text_encoder3]), \
+            "Must provide all three tokenizers and text encoders"
+        self.tokenizer1 = tokenizer1
+        self.text_encoder1 = text_encoder1
+        self.tokenizer2 = tokenizer2
+        self.text_encoder2 = text_encoder2
+        self.tokenizer3 = tokenizer3
+        self.text_encoder3 = text_encoder3
+        self.device = device
+        self.debug = debug
 
     def __len__(self):
         return self.num_samples
@@ -53,29 +79,48 @@ class JointVirtualTryOnDataset(Dataset):
 
         # Base random Gaussian tensors
         person_image    = torch.randn(self.C, self.H, self.W) * scale
-        mask            = torch.rand(1, self.H, self.W)           * scale
+        mask            = torch.rand(1, self.H, self.W)         * scale
         clothing_image  = torch.randn(self.C, self.H, self.W) * scale
         tryon_gt        = torch.randn(self.C, self.H, self.W) * scale
-        depth_gt        = torch.randn(1, self.H, self.W)   * scale
-        normal_gt       = torch.randn(3, self.H, self.W)   * scale
+        depth_gt        = torch.randn(1, self.H, self.W)     * scale
+        normal_gt       = torch.randn(3, self.H, self.W)     * scale
 
-        # Simple placeholder prompt
+        # Create a placeholder prompt
         prompt = f"sample prompt #{idx}"
 
         sample = {
-            "person_image": person_image,
-            "mask":         mask,
+            "person_image":   person_image,
+            "mask":           mask,
             "clothing_image": clothing_image,
-            "tryon_gt":     tryon_gt,
-            "depth_gt":     depth_gt,
-            "normal_gt":    normal_gt,
-            "prompt":       prompt
+            "tryon_gt":       tryon_gt,
+            "depth_gt":       depth_gt,
+            "normal_gt":      normal_gt,
+            "prompt":         prompt
         }
 
         # Apply any user-provided transform (e.g. normalization) to image tensors
         if self.transform is not None:
-            # expects transform to take and return the full sample dict
             sample = self.transform(sample)
+
+        # Now encode the prompt into embeddings
+        pe, pp = encode_prompt(
+            model=None,  # not used inside encode_prompt
+            tokenizer1=self.tokenizer1,
+            text_encoder1=self.text_encoder1,
+            tokenizer2=self.tokenizer2,
+            text_encoder2=self.text_encoder2,
+            tokenizer3=self.tokenizer3,
+            text_encoder3=self.text_encoder3,
+            prompts=[sample["prompt"]],
+            device=self.device,
+            debug=self.debug
+        )
+        # pe: [1, seq_len, dim], pp: [1, 2048]
+        sample["prompt_embeds"] = pe.squeeze(0)
+        sample["pooled_prompt"] = pp.squeeze(0)
+
+        # remove raw prompt string if you like
+        sample.pop("prompt")
 
         return sample
 
