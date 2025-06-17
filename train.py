@@ -125,7 +125,7 @@ def main():
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}")
         for batch_idx, batch in enumerate(pbar):
             # to device
-            person   = batch["person_image"].to(device, dtype=torch.float16)
+            overlay  = batch["overlay_image"].to(device, dtype=torch.float16)
             mask     = batch["mask"].to(device, dtype=torch.float16)
             cloth    = batch["cloth_image"].to(device, dtype=torch.float16)
             tryon    = batch["overlay_image"].to(device, dtype=torch.float16)
@@ -136,7 +136,7 @@ def main():
             pp       = batch["pooled_prompt"].to(device, dtype=torch.float16)
 
             # forward
-            ctrl = prepare_control_input(person, mask, cloth, model.vae, args.debug)
+            ctrl = prepare_control_input(overlay, mask, cloth, model.vae, args.debug)
             tgt  = prepare_target_latents(tryon, depth, normal, model.vae, args.debug)
             noised, noise, t = add_noise(tgt, args.debug)
             pred = model(noised, t, ctrl, pe, pp)
@@ -172,7 +172,7 @@ def main():
         val_losses = []
         with torch.no_grad():
             for batch in val_loader:
-                person   = batch["person_image"].to(device, dtype=torch.float16)
+                overlay   = batch["overlay_image"].to(device, dtype=torch.float16)
                 mask     = batch["mask"].to(device, dtype=torch.float16)
                 cloth    = batch["cloth_image"].to(device, dtype=torch.float16)
                 tryon    = batch["overlay_image"].to(device, dtype=torch.float16)
@@ -181,7 +181,7 @@ def main():
                 pe       = batch["prompt_embeds"].to(device, dtype=torch.float16)
                 pp       = batch["pooled_prompt"].to(device, dtype=torch.float16)
 
-                ctrl = prepare_control_input(person, mask, cloth, model.vae, False)
+                ctrl = prepare_control_input(overlay, mask, cloth, model.vae, False)
                 tgt  = prepare_target_latents(tryon, depth, normal, model.vae, False)
                 noised, noise, t = add_noise(tgt, False)
                 pred = model(noised, t, ctrl, pe, pp)

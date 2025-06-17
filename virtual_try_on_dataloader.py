@@ -7,6 +7,8 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import torchvision.transforms as transforms
 from torch.multiprocessing import freeze_support
+from torch.utils.data import random_split
+from torchvision.transforms import functional as F
 
 
 # ---------------------- CONFIGURATION ----------------------
@@ -114,7 +116,7 @@ class VirtualTryOnDataset(Dataset):
             'pooled_prompt': pp
         }
 
-def custom_collate_fn(batch):
+def virtual_try_on_collate_fn(batch):
     include_caption = (random.random() < 0.2)
 
     batch_dict = {

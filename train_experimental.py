@@ -1,4 +1,4 @@
-# train.py
+# train_experimental.py
 
 import os
 import argparse
@@ -20,6 +20,8 @@ from utils import (
     save_checkpoint,
     load_checkpoint
 )
+# Import function providing both train and validation loaders
+from virtual_try_on_dataloader import get_train_val_loaders
 
 import wandb  # for logging if enabled
 
@@ -29,7 +31,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train DeepFit (SD3-ControlNet) for Virtual Try-On (image-only latents)")
+    parser = argparse.ArgumentParser(
+        description="Train DeepFit (SD3-ControlNet) for Virtual Try-On (image-only latents)"
+    )
     parser.add_argument("--data_root", type=str, required=True, help="Root directory for dataset")
     parser.add_argument("--device", type=str, default="cuda", help="Device: cuda or cpu")
     parser.add_argument("--batch_size", type=int, default=1)
@@ -43,18 +47,20 @@ def parse_args():
     parser.add_argument("--save_every_steps", type=int, default=100)
     parser.add_argument("--resume_step", type=int, default=None, help="If provided, resume from this step")
     parser.add_argument("--debug", action="store_true", help="Enable debug prints")
+    # If the loader function supports val_fraction, you can include it; otherwise omit
+    parser.add_argument("--val_fraction", type=float, default=0.1, help="Fraction for validation split (if loader uses it)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    # Set logging level to DEBUG if requested
     if args.debug:
         logger.setLevel(logging.DEBUG)
 
     seed_everything(args.seed)
 
-    # Setup W&B if requested
+    # W&B setup
+    wandb_config = None
     if args.wandb_project:
         wandb_config = {
             "project": args.wandb_project,
@@ -64,165 +70,174 @@ def main():
                 "batch_size": args.batch_size,
                 "num_epochs": args.num_epochs,
                 "lr": args.lr,
-                "seed": args.seed
+                "seed": args.seed,
+                "val_fraction": args.val_fraction,
             },
             "tags": ["sd3", "controlnet", "virtual-tryon", "image-only-latents"]
         }
-    else:
-        wandb_config = None
     use_wandb = setup_wandb(wandb_config)
 
-    device = args.device if torch.cuda.is_available() else "cpu"
+    # Device handling
+    if args.device == "cuda" and not torch.cuda.is_available():
+        logger.warning("CUDA requested but not available; falling back to CPU.")
+        device = "cpu"
+    else:
+        device = args.device
     logger.info(f"Using device: {device}")
 
-    # Dataset & DataLoader
+    # Obtain train and validation loaders from provided function
     try:
-        dataset = JointVirtualTryOnDataset(data_root=args.data_root)
-    except NotImplementedError:
-        logger.error("Dataset not implemented in utils.py. Please implement JointVirtualTryOnDataset.")
+        train_loader, val_loader = get_train_val_loaders(
+            args.data_root,
+            batch_size=args.batch_size,
+            val_fraction=args.val_fraction,
+            seed=args.seed,
+            num_workers=4
+        )
+    except Exception as e:
+        logger.error(f"Error obtaining train/val loaders: {e}")
         return
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
-    logger.info(f"Dataset loaded. Number of samples: {len(dataset)}. Batch size: {args.batch_size}.")
+    logger.info(f"Obtained train loader with {len(train_loader)} batches and val loader with {len(val_loader)} batches.")
 
-    # Model: instantiate with 16-channel latents
+    # Model instantiation (16-channel latents)
     model = DeepFit(
         device=device,
         debug=args.debug,
         transformer_in_channels=16,
         transformer_out_channels=16,
         controlnet_in_latent_channels=16,
-        controlnet_cond_channels=33  # typically unchanged: person(16) + mask(1) + clothing(16) = 33
+        controlnet_cond_channels=33
     ).to(device)
     model.train()
-    logger.info("Model instantiated (16-channel latents) and set to train mode.")
+    logger.info("Model instantiated and set to train mode.")
 
     # Optimizer
     optimizer = setup_optimizer(model, lr=args.lr)
-    num_trainable = len([p for p in model.parameters() if p.requires_grad])
-    logger.info(f"Optimizer set up with lr={args.lr}. Number of trainable params: {num_trainable}")
+    num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Optimizer lr={args.lr}; trainable params: {num_trainable:,}")
 
-    # Resume if needed
-    start_step = 0
+    # Resume checkpoint if requested
+    global_step = 0
     if args.resume_step is not None:
         try:
             model, optimizer = load_checkpoint(
                 model, optimizer, args.resume_step,
                 checkpoint_dir=args.checkpoint_dir, device=device
             )
-            start_step = args.resume_step + 1
-            logger.info(f"Resumed from checkpoint step {args.resume_step}. Starting at step {start_step}.")
+            global_step = args.resume_step + 1
+            logger.info(f"Resumed from step {args.resume_step}; continuing at {global_step}")
         except Exception as e:
-            logger.error(f"Error loading checkpoint at step {args.resume_step}: {e}")
+            logger.error(f"Failed to load checkpoint at step {args.resume_step}: {e}")
             return
 
-    global_step = start_step
-    logger.info(f"Starting training from step {global_step}.")
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
 
-    for epoch in range(args.num_epochs):
-        epoch_losses = []
-        logger.info(f"=== Epoch {epoch+1}/{args.num_epochs} ===")
-        pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch+1}")
-        for batch_idx, batch in pbar:
-            # Move inputs to device; assume __getitem__ returns tensors [C,H,W]
-            # We only need: person_image, mask, clothing_image, tryon_gt, and prompt
-            person = batch["person_image"].to(device, dtype=torch.float16)      # [B, C, H, W]
-            mask = batch["mask"].to(device, dtype=torch.float16)               # [B, 1, H, W]
-            clothing = batch["clothing_image"].to(device, dtype=torch.float16) # [B, C, H, W]
-            tryon_gt = batch["tryon_gt"].to(device, dtype=torch.float16)       # [B, C, H, W]
-            prompts = batch["prompt"]  # list[str] length B
+    try:
+        for epoch in range(args.num_epochs):
+            # --- Training ---
+            model.train()
+            train_losses = []
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}")
+            for batch in pbar:
+                # Expect batch to include prompt_embeds and pooled_prompt directly
+                overlay = batch["overlay_image"].to(device, dtype=torch.float16)
+                mask = batch["mask"].to(device, dtype=torch.float16)
+                clothing = batch["clothing_image"].to(device, dtype=torch.float16)
+                tryon_gt = batch["tryon_gt"].to(device, dtype=torch.float16)
+                prompt_embeds = batch.get("prompt_embeds", None)
+                pooled_prompt = batch.get("pooled_prompt", None)
+                if prompt_embeds is not None:
+                    prompt_embeds = prompt_embeds.to(device, dtype=torch.float16)
+                if pooled_prompt is not None:
+                    pooled_prompt = pooled_prompt.to(device, dtype=torch.float16)
 
-            B = person.shape[0]
-            if args.debug:
-                logger.debug(f"Batch {batch_idx+1}: person {person.shape}, mask {mask.shape}, clothing {clothing.shape}, tryon_gt {tryon_gt.shape}")
+                B = person.size(0)
 
-            # 1. Encode prompt
-            prompt_embeds, pooled_prompt = encode_prompt(
-                model=model,
-                tokenizer1=model.tokenizer1,
-                text_encoder1=model.text_encoder1,
-                tokenizer2=model.tokenizer2,
-                text_encoder2=model.text_encoder2,
-                tokenizer3=model.tokenizer3,
-                text_encoder3=model.text_encoder3,
-                prompts=prompts,
-                device=device,
-                debug=args.debug
-            )
-            if args.debug:
-                logger.debug(f"Encoded prompt: prompt_embeds shape {prompt_embeds.shape}, pooled_prompt shape {pooled_prompt.shape}")
+                # 1. Prepare control input
+                control_input = prepare_control_input(overlay, mask, clothing, vae=model.vae, debug=args.debug)
 
-            # 2. Prepare control input
-            control_input = prepare_control_input(person, mask, clothing, vae=model.vae, debug=args.debug)
-            if args.debug:
-                logger.debug(f"Control input shape: {control_input.shape}")
+                # 2. Encode tryon_gt via VAE to image latents
+                with torch.no_grad():
+                    latent_dist = model.vae.encode(tryon_gt).latent_dist
+                    tryon_latents = latent_dist.sample()
+                tryon_latents = (tryon_latents - model.vae.config.shift_factor) * model.vae.config.scaling_factor
 
-            # 3. Encode tryon_gt via VAE to get image latents [B,16,h/8,w/8]
-            latent_dist = model.vae.encode(tryon_gt).latent_dist
-            tryon_latents = latent_dist.sample()
-            tryon_latents = (tryon_latents - model.vae.config.shift_factor) * model.vae.config.scaling_factor
-            if args.debug:
-                logger.debug(f"Tryon image latents shape: {tryon_latents.shape}")
+                # 3. Add noise to image latents
+                timesteps = torch.rand(B, device=device)
+                noise_img = torch.randn_like(tryon_latents)
+                noisy_img = tryon_latents + noise_img * timesteps[:, None, None, None]
 
-            # 4. Add noise ONLY to image latents
-            timesteps = torch.rand(B, device=device)  # [B], continuous in [0,1]
-            noise_img = torch.randn_like(tryon_latents)  # [B,16,h/8,w/8]
-            noisy_img = tryon_latents + noise_img * timesteps[:, None, None, None]
-            if args.debug:
-                logger.debug(f"Noisy image latents shape: {noisy_img.shape}, timesteps shape: {timesteps.shape}")
+                # 4. Forward + loss
+                pred_noise = model(noisy_img, timesteps, control_input, prompt_embeds, pooled_prompt)
+                loss = F.mse_loss(pred_noise.float(), noise_img.float())
 
-            # 5. Forward through model: pass only image latents as hidden_states
-            if args.debug:
-                logger.debug("Starting model forward pass (image-only latents)...")
-            model_pred = model(
-                noisy_img,          # hidden_states: [B,16,h/8,w/8]
-                timesteps,          # [B]
-                control_input,      # conditioning
-                prompt_embeds,
-                pooled_prompt
-            )
-            # model_pred shape: [B,16,h/8,w/8]
-            if args.debug:
-                logger.debug(f"Model forward output shape: {model_pred.shape}")
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
-            # 6. Compute loss on image channels: MSE between predicted noise and true noise_img
-            # model_pred is predicted noise for image latents
-            pred_img_noise = model_pred  # [B,16,...]
-            loss = F.mse_loss(pred_img_noise.float(), noise_img.float())
-            if args.debug:
-                logger.debug(f"Computed loss (image-only) = {loss.item():.6f}")
+                train_losses.append(loss.item())
+                global_step += 1
 
-            # 7. Backprop & gradient norm logging
-            optimizer.zero_grad()
-            loss.backward()
-            if args.debug:
-                logger.debug("Backward pass done. Computing gradient norms for all trainable parameters...")
+                # W&B logging
+                if use_wandb:
+                    wandb.log({"train/loss": loss.item()}, step=global_step)
 
-            # Compute gradient norms
-            grad_norms = {}
-            for name, param in model.named_parameters():
-                if param.requires_grad and param.grad is not None:
-                    try:
-                        norm = param.grad.norm().item()
-                        grad_norms[f"grad_norm/{name}"] = norm
-                    except Exception as e:
-                        logger.warning(f"Could not compute grad norm for {name}: {e}")
-            # Log to W&B
-            if use_wandb and grad_norms:
-                wandb.log(grad_norms, step=global_step)
-            if args.debug and grad_norms:
-                avg_norm = float(np.mean(list(grad_norms.values())))
-                logger.debug(f"Average gradient norm: {avg_norm:.6f}")
+                # Checkpoint
+                if args.save_every_steps and global_step % args.save_every_steps == 0:
+                    save_checkpoint(model, optimizer, global_step, checkpoint_dir=args.checkpoint_dir)
 
-            # 8. Optimizer step
-            optimizer.step()
-            if args.debug:
-                logger.debug("Optimizer step completed.")
+                pbar.set_postfix(train_loss=float(np.mean(train_losses[-10:])))
 
-            # Record loss etc.
-            epoch_losses.append(_
+            avg_train = float(np.mean(train_losses)) if train_losses else 0.0
+            logger.info(f"Epoch {epoch+1} train loss: {avg_train:.6f}")
+            if use_wandb:
+                wandb.log({"epoch/train_loss": avg_train}, step=global_step)
+
+            # --- Validation ---
+            model.eval()
+            val_losses = []
+            with torch.no_grad():
+                for batch in val_loader:
+                    overlay = batch["overlay_image"].to(device, dtype=torch.float16)
+                    mask = batch["mask"].to(device, dtype=torch.float16)
+                    clothing = batch["clothing_image"].to(device, dtype=torch.float16)
+                    tryon_gt = batch["tryon_gt"].to(device, dtype=torch.float16)
+                    prompt_embeds = batch.get("prompt_embeds", None)
+                    pooled_prompt = batch.get("pooled_prompt", None)
+                    if prompt_embeds is not None:
+                        prompt_embeds = prompt_embeds.to(device, dtype=torch.float16)
+                    if pooled_prompt is not None:
+                        pooled_prompt = pooled_prompt.to(device, dtype=torch.float16)
+
+                    control_input = prepare_control_input(overlay, mask, clothing, vae=model.vae, debug=False)
+                    latent_dist = model.vae.encode(tryon_gt).latent_dist
+                    tryon_latents = (latent_dist.sample() - model.vae.config.shift_factor) * model.vae.config.scaling_factor
+                    timesteps = torch.rand(overlay_image.size(0), device=device)
+                    noise_img = torch.randn_like(tryon_latents)
+                    noisy_img = tryon_latents + noise_img * timesteps[:, None, None, None]
+
+                    pred_noise = model(noisy_img, timesteps, control_input, prompt_embeds, pooled_prompt)
+                    v_loss = F.mse_loss(pred_noise.float(), noise_img.float())
+                    val_losses.append(v_loss.item())
+
+            avg_val = float(np.mean(val_losses)) if val_losses else 0.0
+            logger.info(f"Epoch {epoch+1} val loss: {avg_val:.6f}")
+            if use_wandb:
+                wandb.log({"epoch/val_loss": avg_val}, step=global_step)
+
+            # Save checkpoint at epoch end
+            save_checkpoint(model, optimizer, global_step, checkpoint_dir=args.checkpoint_dir)
+            logger.info(f"Saved checkpoint at end of epoch {epoch+1}, step {global_step}")
+
+    except KeyboardInterrupt:
+        logger.warning("Training interrupted; saving checkpoint...")
+        save_checkpoint(model, optimizer, global_step, checkpoint_dir=args.checkpoint_dir)
+    finally:
+        if use_wandb:
+            wandb.finish()
+        logger.info("Training complete.")
+
+
+if __name__ == "__main__":
+    main()
+

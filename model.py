@@ -1,11 +1,11 @@
 # # model.py
 
-# import torch
-# import torch.nn as nn
-# from diffusers import AutoencoderKL, SD3Transformer2DModel, SD3ControlNetModel, FlowMatchEulerDiscreteScheduler
-# from transformers import CLIPTextModelWithProjection, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+import torch
+import torch.nn as nn
+from diffusers import AutoencoderKL, SD3Transformer2DModel, SD3ControlNetModel, FlowMatchEulerDiscreteScheduler
+from transformers import CLIPTextModelWithProjection, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 
-# from utils import modify_transformer_channels, modify_controlnet_channels  # remove freeze_non_trainable_components
+from utils import modify_transformer_channels, modify_controlnet_channels  # remove freeze_non_trainable_components
 
 # class DeepFit(nn.Module):
 #     """
@@ -257,11 +257,7 @@
 
 
 
-import torch
-import torch.nn as nn
-from diffusers import AutoencoderKL, SD3Transformer2DModel, SD3ControlNetModel, FlowMatchEulerDiscreteScheduler
 
-from utils import modify_transformer_channels, modify_controlnet_channels
 
 class DeepFit(nn.Module):
     """
@@ -376,7 +372,7 @@ class DeepFit(nn.Module):
             encoder_hidden_states=prompt_embeds,
             pooled_projections=pooled_prompt,
             controlnet_cond=control_input,
-            conditioning_scale=1.0,
+            conditioning_scale=2.0,
             return_dict=False
         )[0]
 
