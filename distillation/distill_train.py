@@ -29,7 +29,7 @@ from accelerate import Accelerator
 
 from model import DeepFit
 from utils import JointVirtualTryOnDataset, seed_everything, setup_wandb
-from distill_utils import LADDDistillationWrapper
+from distillation.distill_utils import LADDDistillationWrapper
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

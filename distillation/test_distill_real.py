@@ -5,7 +5,7 @@ import logging
 import time
 
 from model import DeepFit
-from distill_utils import LatentDiscriminator, LADDDistillationWrapper
+from distillation.distill_utils import LatentDiscriminator, LADDDistillationWrapper
 
 # Optionally import GPU check
 import sys
