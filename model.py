@@ -334,7 +334,7 @@ class DeepFit(nn.Module):
 
         # Unfreeze ControlNet patch embed and attention layers
         for n, p in self.controlnet.named_parameters():
-            if "pos_embed.proj" in n or "pos_embed_input.proj" in n or (".transformer_blocks." in n and ".attn." in n):
+            if "pos_embed.proj" in n or "pos_embed_input.proj" in n or "controlnet_blocks" or (".transformer_blocks." in n and ".attn." in n):
                 p.requires_grad = True
                 if debug:
                     print(f"[DEBUG] Unfrozen controlnet param: {n}")

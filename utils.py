@@ -2,7 +2,7 @@
 
 import os
 import logging
-from typing import List, Tuple, Dict, Any
+from typing import Optional,List, Tuple, Dict, Any          
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -145,15 +145,15 @@ def modify_transformer_channels(transformer: SD3Transformer2DModel, new_in_chann
     # We try to reuse existing attributes if present; otherwise rely on config.
     # For simplicity, assume the original PatchEmbed has attributes patch_size, patch_embed_size or can infer from config.
     # Adjust as needed if your diffusers version differs.
-    if hasattr(orig_patch_embed, "patch_embed_size"):
-        height, width = orig_patch_embed.patch_embed_size
-    else:
+    # if hasattr(orig_patch_embed, "patch_embed_size"):
+    #     height, width = orig_patch_embed.patch_embed_size
+    # else:
         # fallback: if transformer.config contains image_size
-        size = transformer.config.get("image_size", None)
-        if size is None:
-            raise ValueError("Cannot infer PatchEmbed image size; set patch_embed_size or config['image_size']")
-        height = 128
-        width = 96
+    size = [128,96]
+    if size is None:
+        raise ValueError("Cannot infer PatchEmbed image size; set patch_embed_size or config['image_size']")
+    height = 128
+    width = 96
     patch_size = 2
     # pos_embed_max_size = getattr(orig_patch_embed, "pos_embed_max_size", None)
     pos_embed_max_size = 96
@@ -264,7 +264,7 @@ def modify_controlnet_channels(controlnet: SD3ControlNetModel,
     if hasattr(orig_pos_in, "patch_embed_size"):
         height_in, width_in = orig_pos_in.patch_embed_size
     else:
-        size = controlnet.config.get("image_size", None)
+        size = [128,96]
         if size is None:
             raise ValueError("Cannot infer ControlNet pos_embed_input image size; set patch_embed_size or config['image_size']")
         height_in =128
