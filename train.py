@@ -113,7 +113,7 @@ def main():
         categories=args.categories,
         batch_size=args.batch_size,
         shuffle_train=True,
-        num_workers=4
+        num_workers=8
     )
     logger.info(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
@@ -161,6 +161,10 @@ def main():
             loss = F.mse_loss(pred.float(), noise.float()) / accum_steps
             train_losses.append(loss.item() * accum_steps)
             loss.backward()
+            # if use_wandb and wandb.run is not None:
+            #     logger.info(f"W&B URL: {wandb.run.get_url}")
+            # print(wandb.run.get_url)    
+        
 
             # Step, logging & periodic save
             if (batch_idx + 1) % accum_steps == 0:
@@ -182,6 +186,7 @@ def main():
                     logger.info(f"Saved checkpoint at step {global_step}")
 
         # End of epoch: logging and final save
+            
         avg_train = float(np.mean(train_losses))
         logger.info(f"Epoch {epoch+1} train loss: {avg_train:.4f}")
         if use_wandb:
@@ -226,6 +231,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 

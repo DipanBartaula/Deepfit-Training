@@ -2,7 +2,7 @@
 REM run_train_full_args.bat
 REM Batch script with populated fields for DeepFit training on Windows CMD.
 
-:: Pre-populated configuration
+:: --- Configuration ---
 set TrainRoot=D:\PUL - DeepFit\Dresscode
 set ValRoot=D:\PUL - DeepFit\Test
 set Categories=dresses upper_body lower_body upper_body1
@@ -14,26 +14,30 @@ set NumEpochs=79
 set Lr=1e-5
 set Seed=42
 
-set WandbProject=your_wandb_project
-set WandbEntity=your_wandb_entity
-:: Generate WandB run name without spaces (user can adjust as needed)
-set WandbName=run_%DATE:~10,4%%DATE:~4,2%%DATE:~7,2%_%TIME:~0,2%%TIME:~3,2%%TIME:~6,2%
-:: Replace spaces in time (e.g., leading space in hour) with zero
-set WandbName=%WandbName: =0%
-:: Remove any colons from time
-set WandbName=%WandbName::=%
+set WandbProject=Deepfit_Training
+set WandbEntity=mannfeyn71-tribhuvan-university-institute-of-engineering
+
+:: Generate WandB run name (YYYYMMDD_HHMMSS)
+for /f "tokens=2 delims==" %%I in ('wmic OS GET LocalDateTime /value') do set ldt=%%I
+set WandbName=run_%ldt:~0,8%_%ldt:~8,6%
 
 set CheckpointDir=E:\Deepfit-Training\checkpoints
 set SaveEverySteps=100
 set ResumeStep=
 set DebugFlag=--debug
 
-:: Ensure checkpoint directory exists
+:: --- Prep ---
 if not exist "%CheckpointDir%" (
     mkdir "%CheckpointDir%"
 )
 
-:: Construct python command
+:: Ensure WANDB_API_KEY is in the environment
+:: (you can also `set WANDB_API_KEY=your_key_here` here)
+if "%WANDB_API_KEY%"=="" (
+    echo WARNING: WANDB_API_KEY not set in environment.
+)
+
+:: --- Build command ---
 set CMD=python train.py ^
   --train_root "%TrainRoot%" ^
   --val_root "%ValRoot%" ^
@@ -48,13 +52,17 @@ set CMD=python train.py ^
 if not "%WandbProject%"=="" (
     set CMD=%CMD% --wandb_project %WandbProject%
     if not "%WandbEntity%"=="" set CMD=%CMD% --wandb_entity %WandbEntity%
-    if not "%WandbName%"=="" set CMD=%CMD% --wandb_name %WandbName%
+    if not "%WandbName%"==""   set CMD=%CMD% --wandb_name %WandbName%
 )
 
 set CMD=%CMD% --checkpoint_dir "%CheckpointDir%" --save_every_steps %SaveEverySteps%
 if not "%ResumeStep%"=="" set CMD=%CMD% --resume_step %ResumeStep%
-if defined DebugFlag set CMD=%CMD% %DebugFlag%
+if defined DebugFlag    set CMD=%CMD% %DebugFlag%
 
-:: Execute
-echo Running: %CMD%
+:: --- Execute ---
+echo.
+echo Running:
+echo    %CMD%
+echo.
+
 %CMD%

@@ -8,10 +8,11 @@ from PIL import Image
 import torchvision.transforms as transforms
 
 # ---------------------- CONFIGURATION ----------------------
-IMAGE_SIZE = (1024,768)
+IMAGE_SIZE = (512,512)
 
 NORMALIZE_MEAN = (0.5, 0.5, 0.5)
 NORMALIZE_STD = (0.5, 0.5, 0.5)
+
 
 # Path to a default .npz that contains embeddings for the empty prompt ("")
 # Must contain arrays `prompt_embed` and `pooled_prompt`
@@ -23,10 +24,19 @@ transform = transforms.Compose([
     transforms.Normalize(NORMALIZE_MEAN, NORMALIZE_STD)
 ])
 
-basic_transform = transforms.Compose([
+
+depth_transform = transforms.Compose([
+    transforms.Resize(IMAGE_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize(0.5,0.5)
+])
+
+
+basic_transform=transforms.Compose([
     transforms.Resize(IMAGE_SIZE),
     transforms.ToTensor()
 ])
+
 
 
 class VirtualTryOnDataset(Dataset):
@@ -81,13 +91,10 @@ class VirtualTryOnDataset(Dataset):
         overlay_pil = Image.fromarray(overlay_np)
 
         # Transforms
-        person_image  = person_image_pil.ToTensor()
-        person_image=person_image.Normalize(NORMALIZE_MEAN, NORMALIZE_STD)
+        person_image  = transform(person_image_pil)
         cloth_image   = transform(cloth_image)
-        normal_map  = normal_map.ToTensor()
-        normal_map=normal_map.Normalize(NORMALIZE_MEAN, NORMALIZE_STD)
-        depth_map  = depth_map.ToTensor()
-        depth_map=depth_map.Normalize(NORMALIZE_MEAN, NORMALIZE_STD)
+        normal_map  = transform(normal_map) 
+        depth_map  = depth_transform(depth_map) 
         mask_tensor   = basic_transform(mask_pil)
         overlay_image = transform(overlay_pil)
 
@@ -178,13 +185,10 @@ class ValidationDataset(Dataset):
         overlay_np = (person_np * (1 - alpha) + grey * alpha).astype(np.uint8)
         overlay_pil = Image.fromarray(overlay_np)
 
-        person_image  = person_image_pil.ToTensor()
-        person_image=person_image.Normalize(NORMALIZE_MEAN, NORMALIZE_STD)
+        person_image  = transform(person_image_pil)
         cloth_image   = transform(cloth_image)
-        normal_map  = normal_map.ToTensor()
-        normal_map=normal_map.Normalize(NORMALIZE_MEAN, NORMALIZE_STD)
-        depth_map  = depth_map.ToTensor()
-        depth_map=depth_map.Normalize(NORMALIZE_MEAN, NORMALIZE_STD)
+        normal_map  = transform(normal_map) 
+        depth_map  = depth_transform(depth_map) 
         mask_tensor   = basic_transform(mask_pil)
         overlay_image = transform(overlay_pil)
 
@@ -267,7 +271,7 @@ def get_dataloader(
     categories: list,
     batch_size: int,
     shuffle: bool = True,
-    num_workers: int = 4
+    num_workers: int = 8
 ) -> DataLoader:
     ds = VirtualTryOnDataset(root_dir, categories)
     return DataLoader(
