@@ -1,234 +1,212 @@
-import os
+# train.py
+"""
+Training script for DeepFit Virtual Try-On inpainting with:
+- Mixed precision (torch.cuda.amp)
+- Gradient checkpointing always enabled
+- Gradient accumulation for effective batch size
+- Debug print statements for tracing
+- Saving checkpoints every 100 iterations
+- Resuming from latest checkpoint if available
+- Uses accelerate library optionally for multi-GPU or distributed setups
+"""
 import argparse
-import logging
+import os
 import torch
 import torch.nn.functional as F
-import numpy as np
+from torch.optim import AdamW
+from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
-import wandb  # for logging
+
+# Optional: import accelerate
+from accelerate import Accelerator
 
 from model import DeepFit
-from utils import (
-    seed_everything,
-    setup_wandb,
-    prepare_control_input,
-    prepare_target_latents,
-    add_noise,
-    setup_optimizer,
-    save_checkpoint,
-    load_checkpoint,
-    print_trainable_parameters
-)
-from virtual_try_on_dataloader import get_train_val_loaders
+from utils import load_vae, get_noise_scheduler, CheckpointManager
+from dataloader import get_dataloader
 
-# ---------------------------------
-# Train DeepFit (SD3-ControlNet) with W&B logging
-# ---------------------------------
+def prepare_concat_latents(vae, overlay_image, cloth_image, surface_normal, depth_map, mask):
+    """
+    Prepare concatenated latent input for UNet:
+    1) Encode overlay_image & cloth_image via VAE: (B,4,h',w') each → spatial concat width: (B,4,h',2w')
+    2) Encode surface_normal (3ch) & depth_map (1ch→3ch): each via VAE → (B,4,h',w') → spatial concat: (B,4,h',2w')
+    3) Channel-concat those two: (B,8,h',2w')
+    4) Resize mask to (h',w'), create dark zeros, spatial concat width: (B,1,h',2w')
+    5) Channel-concat: (B,9,h',2w') → return final input and overlay_latent (clean) for noise target.
+    """
+    overlay_latent = vae.encode(overlay_image).latent_dist.sample() * vae.config.scaling_factor
+    cloth_latent   = vae.encode(cloth_image).latent_dist.sample() * vae.config.scaling_factor
+    ov_cl = torch.cat([overlay_latent, cloth_latent], dim=3)
 
-# Hard‐coded W&B key (or pull from env)
-WANDB_API_KEY = "522f467266173e2d09d35d6e899e2d39a2fb2b49"
+    depth_rgb = depth_map.repeat(1,3,1,1)
+    normal_latent = vae.encode(surface_normal).latent_dist.sample() * vae.config.scaling_factor
+    depth_latent  = vae.encode(depth_rgb).latent_dist.sample() * vae.config.scaling_factor
+    nd = torch.cat([normal_latent, depth_latent], dim=3)
 
-# Logging setup
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    comb = torch.cat([ov_cl, nd], dim=1)
 
+    h, w2 = comb.shape[2], comb.shape[3] // 2
+    mask_lat = torch.nn.functional.interpolate(mask, size=(h, w2), mode="nearest")
+    dark = torch.zeros_like(mask_lat)
+    md = torch.cat([mask_lat, dark], dim=3)
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Train DeepFit with W&B logging")
-    p.add_argument("--train_root",     type=str,   default="D:\PUL - DeepFit\Dresscode")
-    p.add_argument("--val_root",       type=str,   default="D:\PUL - DeepFit\Dresscode\test")
-    p.add_argument(
-        "--categories",
-        nargs='+',
-        default=['dresses', 'upper_body', 'lower_body', 'upper_body1'],
-        help=(
-            "Space‑separated list of subfolder names under train_root;\n"
-            "defaults to ['dresses','upper_body','lower_body','upper_body1']"
-        )
-    )
-    p.add_argument("--device",         type=str,   default="cuda")
-    p.add_argument("--batch_size",     type=int,   default=2)
-    p.add_argument("--effective_batch_size", type=int, default=128)
-    p.add_argument("--num_epochs",     type=int,   default=10)
-    p.add_argument("--lr",             type=float, default=5*1e-6)
-    p.add_argument("--seed",           type=int,   default=42)
-    p.add_argument("--wandb_project",  type=str,   default=None)
-    p.add_argument("--wandb_entity",   type=str,   default=None)
-    p.add_argument("--wandb_name",     type=str,   default=None)
-    p.add_argument("--checkpoint_dir", type=str,   default="checkpoints")
-    p.add_argument("--resume_step",    type=int,   default=None)
-    p.add_argument("--save_every_steps", type=int, default=None,
-                   help="If set, save a checkpoint every N global steps")
-    p.add_argument("--debug",          action="store_true")
-    return p.parse_args()
+    final = torch.cat([comb, md], dim=1)
+    return final, overlay_latent
 
+def train(args):
+    # Initialize Accelerator for mixed precision and multi-GPU/distributed if desired
+    accelerator = Accelerator(mixed_precision='fp16' if torch.cuda.is_available() else None)
+    device = accelerator.device
+    print(f"[train] Using device from Accelerator: {device}")
 
-def main():
-    args = parse_args()
-    if args.debug:
-        logger.setLevel(logging.DEBUG)
+    # Create output dir
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    # W&B login
-    if WANDB_API_KEY:
-        wandb.login(key=WANDB_API_KEY)
-    else:
-        logger.warning("No W&B API key found.")
+    # Load VAE
+    vae = load_vae(device)
 
-    # W&B init
-    wandb_cfg = None
-    if args.wandb_project:
-        wandb_cfg = {
-            "project": args.wandb_project,
-            "entity": args.wandb_entity,
-            "name": args.wandb_name,
-            "config": {
-                "batch_size": args.batch_size,
-                "effective_batch_size": args.effective_batch_size,
-                "num_epochs": args.num_epochs,
-                "lr": args.lr,
-                "seed": args.seed,
-                "categories": args.categories
-            },
-            "tags": ["sd3", "controlnet", "virtual-tryon"]
-        }
-    use_wandb = setup_wandb(wandb_cfg)
+    # Initialize DeepFit UNet
+    print("[train] Initializing DeepFit UNet...")
+    model_module = DeepFit(pretrained_model_name=args.pretrained, train_self_attention_only=True)
+    unet = model_module.unet
 
-    # Seed
-    seed_everything(args.seed)
+    # Enable gradient checkpointing always
+    print("[train] Enabling gradient checkpointing on UNet...")
+    unet.enable_gradient_checkpointing()
 
-    # Device
-    device = args.device if torch.cuda.is_available() else "cpu"
-    logger.info(f"Using device: {device}")
+    # Setup optimizer on trainable parameters
+    trainable = [p for p in unet.parameters() if p.requires_grad]
+    total_trainable = sum(p.numel() for p in trainable)
+    print(f"[train] Number of trainable parameters: {total_trainable}")
+    optimizer = AdamW(trainable, lr=args.lr)
 
-    # Gradient accumulation
+    # Scheduler and scaler
+    scheduler = get_noise_scheduler()
+    scaler = GradScaler()
+    ckpt_mgr = CheckpointManager(args.output_dir)
+
+    # Attempt resume from latest checkpoint
+    latest_ckpt = ckpt_mgr.get_latest_checkpoint()
+    start_epoch = 1
+    global_step = 0
+    if latest_ckpt:
+        try:
+            epoch_loaded, step_loaded = ckpt_mgr.load(latest_ckpt, unet, optimizer, scaler)
+            if epoch_loaded is not None:
+                start_epoch = epoch_loaded
+            if step_loaded is not None:
+                global_step = step_loaded
+            print(f"[train] Resuming from epoch {start_epoch}, global_step {global_step}")
+        except Exception as e:
+            print(f"[train] Warning: failed to load checkpoint {latest_ckpt}: {e}")
+
+    # DataLoader
+    loader = get_dataloader(args.batch_size, args.num_workers, device)
+
+    # Gradient accumulation settings
     if args.effective_batch_size % args.batch_size != 0:
-        raise ValueError("effective_batch_size must be multiple of batch_size")
+        raise ValueError(f"Effective batch size ({args.effective_batch_size}) must be divisible by micro batch size ({args.batch_size})")
     accum_steps = args.effective_batch_size // args.batch_size
-    logger.info(f"Accumulating over {accum_steps} steps to reach {args.effective_batch_size}")
+    print(f"[train] Gradient accumulation: micro batch size={args.batch_size}, effective batch size={args.effective_batch_size}, accumulation steps={accum_steps}")
 
-    # Data loaders
-    train_loader, val_loader = get_train_val_loaders(
-        train_root=args.train_root,
-        val_root=args.val_root,
-        categories=args.categories,
-        batch_size=args.batch_size,
-        shuffle_train=True,
-        num_workers=8
-    )
-    logger.info(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
-
-    # Model & optimizer
-    model = DeepFit(device=device, debug=args.debug).to(device)
-    model.train()
-    optimizer = setup_optimizer(model, lr=args.lr)
-    n_params = print_trainable_parameters(model)
-    logger.info(f"Trainable parameters: {n_params}")
-
-    # Resume checkpoint
-    start_step = args.resume_step + 1 if args.resume_step is not None else 0
-    if args.resume_step is not None:
-        model, optimizer = load_checkpoint(
-            model, optimizer, args.resume_step,
-            checkpoint_dir=args.checkpoint_dir, device=device
-        )
-    global_step = start_step
-    optimizer.zero_grad()
+    # Prepare everything with accelerator
+    unet, optimizer, loader = accelerator.prepare(unet, optimizer, loader)
 
     # Training loop
-    for epoch in range(args.num_epochs):
-        train_losses = []
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}")
-        for batch_idx, batch in enumerate(pbar):
-            # Move to device
-            overlay = batch["overlay_image"].to(device, dtype=torch.float16)
-            mask    = batch["mask"].to(device, dtype=torch.float16)
-            cloth   = batch["cloth_image"].to(device, dtype=torch.float16)
-            depth   = batch["depth_map"].to(device, dtype=torch.float16)
-            normal  = batch["normal_map"].to(device, dtype=torch.float16)
-            pe      = batch["prompt_embeds"].to(device, dtype=torch.float16)
-            pp      = batch["pooled_prompt"].to(device, dtype=torch.float16)
+    for epoch in range(start_epoch, args.epochs+1):
+        print(f"=== Epoch {epoch}/{args.epochs} ===")
+        unet.train()
+        pbar = tqdm(loader, desc=f"Epoch {epoch}")
+        optimizer.zero_grad()
+        for step, batch in enumerate(pbar):
+            ov = batch["overlay_image"].to(device)
+            cl = batch["cloth_image"].to(device)
+            sn = batch["surface_normal"].to(device)
+            dp = batch["depth_map"].to(device)
+            mk = batch["mask"].to(device)
+            te = batch["text_embeddings"].to(device)
 
-            # Forward
-            ctrl = prepare_control_input(overlay, mask, cloth, model.vae, args.debug)
-            tgt  = prepare_target_latents(overlay, depth, normal, model.vae, args.debug)
-            noised, noise, t = add_noise(tgt, args.debug)
-            noised = noised.to(device, dtype=torch.float16)
-            noise  = noise .to(device, dtype=torch.float16)
-            pred   = model(noised, t, ctrl, pe, pp)
+            # Prepare inputs
+            inp_clean, ov_lat = prepare_concat_latents(vae, ov, cl, sn, dp, mk)
+            B = ov_lat.shape[0]
+            print(f"[train] Batch {step}: overlay_latent shape={ov_lat.shape}, inp_clean shape={inp_clean.shape}")
 
-           
+            # Sample timesteps and add noise
+            t = torch.randint(0, scheduler.num_train_timesteps, (B,), device=device).long()
+            noise = torch.randn_like(ov_lat)
+            noisy = scheduler.add_noise(ov_lat, noise, t)
+            print(f"[train]   Timesteps shape={t.shape}, noisy latent shape={noisy.shape}")
 
-            loss = F.mse_loss(pred.float(), noise.float()) / accum_steps
-            train_losses.append(loss.item() * accum_steps)
-            loss.backward()
-            # if use_wandb and wandb.run is not None:
-            #     logger.info(f"W&B URL: {wandb.run.get_url}")
-            # print(wandb.run.get_url)    
-        
+            # Rebuild noisy input
+            cl_lat = vae.encode(cl).latent_dist.sample() * vae.config.scaling_factor
+            ov_ns = torch.cat([noisy, cl_lat], dim=3)
+            sn_lat = vae.encode(sn).latent_dist.sample() * vae.config.scaling_factor
+            dp_rgb = dp.repeat(1,3,1,1)
+            dp_lat = vae.encode(dp_rgb).latent_dist.sample() * vae.config.scaling_factor
+            nd_sp = torch.cat([sn_lat, dp_lat], dim=3)
+            cmb = torch.cat([ov_ns, nd_sp], dim=1)
+            h, w2 = cmb.shape[2], cmb.shape[3] // 2
+            mk_lat = torch.nn.functional.interpolate(mk, size=(h, w2), mode="nearest")
+            dk = torch.zeros_like(mk_lat)
+            md_sp = torch.cat([mk_lat, dk], dim=3)
+            inp_noisy = torch.cat([cmb, md_sp], dim=1)
+            print(f"[train]   inp_noisy shape={inp_noisy.shape}")
 
-            # Step, logging & periodic save
-            if (batch_idx + 1) % accum_steps == 0:
+            # Forward + loss
+            with autocast():
+                pred = unet(inp_noisy, t, encoder_hidden_states=te)
+                pad = torch.zeros((B,4,ov_lat.shape[2],ov_lat.shape[3]), device=device)
+                noise_pad = torch.cat([noise, pad], dim=3)
+                target = torch.zeros_like(pred)
+                target[:, :4] = noise_pad
+                loss = F.mse_loss(pred, target) / accum_steps
+            print(f"[train]   Loss/divided={loss.item():.6f}")
+
+            accelerator.backward(loss)
+
+            # Gradient accumulation and optimizer step
+            if (step + 1) % accum_steps == 0:
+                global_step += 1
+                print(f"[train]   Performing optimizer.step() at global step {global_step}")
+                if args.max_grad_norm > 0:
+                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad()
+            else:
+                print(f"[train]   Accumulating gradients: step {step+1}/{accum_steps}")
                 global_step += 1
 
-                avg_loss = float(np.mean(train_losses[-accum_steps:]))
-                if use_wandb:
-                    wandb.log({"train/loss": avg_loss}, step=global_step)
-                pbar.set_postfix(loss=avg_loss)
+            # Save checkpoint every 100 iterations
+            if global_step % 100 == 0:
+                print(f"[train]   Saving checkpoint at global step {global_step}")
+                ckpt_mgr.save(unet, optimizer, scaler=None, epoch=epoch, step=global_step)
 
-                # Save every N steps if requested
-                if args.save_every_steps and global_step % args.save_every_steps == 0:
-                    save_checkpoint(
-                        model, optimizer, global_step,
-                        checkpoint_dir=args.checkpoint_dir
-                    )
-                    logger.info(f"Saved checkpoint at step {global_step}")
+            pbar.set_postfix({"loss": loss.item(), "step": global_step})
 
-        # End of epoch: logging and final save
-            
-        avg_train = float(np.mean(train_losses))
-        logger.info(f"Epoch {epoch+1} train loss: {avg_train:.4f}")
-        if use_wandb:
-            wandb.log({"epoch/train_loss": avg_train}, step=global_step)
+        # End of epoch: leftover grads
+        if len(loader) % accum_steps != 0:
+            print("[train]   Final optimizer step for leftover gradients at epoch end")
+            if args.max_grad_norm > 0:
+                accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad()
 
-        # Validation
-        model.eval()
-        val_losses = []
-        with torch.no_grad():
-            for batch in val_loader:
-                overlay = batch["overlay_image"].to(device, dtype=torch.float16)
-                mask    = batch["mask"].to(device, dtype=torch.float16)
-                cloth   = batch["cloth_image"].to(device, dtype=torch.float16)
-                depth   = batch["depth_map"].to(device, dtype=torch.float16)
-                normal  = batch["normal_map"].to(device, dtype=torch.float16)
-                pe      = batch["prompt_embeds"].to(device, dtype=torch.float16)
-                pp      = batch["pooled_prompt"].to(device, dtype=torch.float16)
+        # Save epoch checkpoint
+        print(f"[train] Saving end-of-epoch checkpoint for epoch {epoch}")
+        ckpt_mgr.save(unet, optimizer, scaler=None, epoch=epoch, step=global_step)
+        print(f"[train] Epoch {epoch} checkpoint saved.")
 
-                ctrl = prepare_control_input(overlay, mask, cloth, model.vae, False)
-                tgt  = prepare_target_latents(overlay, depth, normal, model.vae, False)
-                noised, noise, t = add_noise(tgt, False)
-                pred = model(noised, t, ctrl, pe, pp)
-
-                val_losses.append(F.mse_loss(pred.float(), noise.float()).item())
-
-        avg_val = float(np.mean(val_losses))
-        logger.info(f"Epoch {epoch+1} val loss: {avg_val:.4f}")
-        if use_wandb:
-            wandb.log({"epoch/val_loss": avg_val}, step=global_step)
-
-        # Always save at end of epoch
-        save_checkpoint(
-            model, optimizer, global_step,
-            checkpoint_dir=args.checkpoint_dir
-        )
-        logger.info(f"Saved end‑of‑epoch checkpoint at step {global_step}")
-        model.train()
-
-    if use_wandb:
-        wandb.finish()
-
+    print("[train] Training completed.")
 
 if __name__ == "__main__":
-    main()
-
+    parser = argparse.ArgumentParser("Train DeepFit Virtual Try-On Inpainting Model with Accelerate")
+    parser.add_argument("--pretrained", type=str, default="stabilityai/stable-diffusion-2-inpainting",
+                        help="Hugging Face model identifier for Stable Diffusion v2 inpainting UNet")
+    parser.add_argument("--batch_size", type=int, required=True, help="Micro batch size per step")
+    parser.add_argument("--effective_batch_size", type=int, required=True, help="Desired effective batch size for gradient accumulation")
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--output_dir", type=str, default="checkpoints")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm for clipping; set <=0 to disable")
+    args = parser.parse_args()
+    train(args)

@@ -1,9 +1,9 @@
-torch>=2.0.0
-diffusers>=0.14.0
-transformers>=4.30.0
-accelerate>=0.20.0
-ema-pytorch>=0.3.0
-wandb>=0.14.0
-numpy>=1.23.0
-Pillow>=9.0.0
-tqdm>=4.64.0
+# DeepFit Virtual Try-On Inpainting dependencies
+torch
+torchvision
+diffusers
+transformers
+accelerate
+safetensors
+huggingface-hub
+tqdm
